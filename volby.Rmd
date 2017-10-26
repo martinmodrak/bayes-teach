@@ -1,0 +1,374 @@
+---
+title: "Volby - test"
+output: html_notebook
+---
+
+```{r setup}
+library(rstan)
+library(brms)
+library(ggplot2)
+library(tidyverse)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+logistic = function(x) {1/(1 + exp(-x))}
+
+```
+
+
+```{r}
+volby = read.csv2('volby.csv') %>% mutate(Podil_Kraj = Hlasy_Kraj / Ucast_Kraj, Podil_PSP = Hlasy_PSP / Ucast_PSP, Logit_Kraj = log(Podil_Kraj / (1 - Podil_Kraj)), Normalized_Kraj_All = (Logit_Kraj - mean(Logit_Kraj)) / sd(Logit_Kraj)) %>% group_by(Strana) %>% mutate(Normalized_Kraj_Strana = (Logit_Kraj - mean(Logit_Kraj)) / sd(Logit_Kraj)) %>% ungroup()
+
+volby %>% gather(Volby, Podil, Podil_PSP, Podil_Kraj) %>% mutate(Rok = if_else(Volby == "Podil_Kraj", Rok_Kraj, Rok_PSP)) %>% ggplot(aes(x = Rok_PSP, y = Podil, color = Strana, linetype = Volby)) + geom_line() + geom_point() #+ coord_cartesian(ylim = c(0,1))
+```
+
+```{r}
+pts= seq(0.7,0.73,by = 0.001)
+data.frame(x = pts, y = dbeta(pts, 284276 - 81777,81778)) %>% ggplot(aes(x=x,y=y)) + geom_point()
+
+```
+
+
+```{r}
+plot_samples = function(samples, title) {
+samples %>% mutate(Sample = as.factor(Sample)) %>% ggplot(aes(x = Rok_PSP, y = Predicted_PSP, color = Sample)) + geom_line(alpha = 0.3) + facet_wrap( ~ Strana) + guides(color = FALSE) + 
+  ggtitle(title) #+ coord_cartesian(ylim= c(0,1))
+  
+}
+```
+
+#Wrong normal model
+
+
+#Simple Beta model
+```{r}
+sample_volby_normal = function(volby, precision_samples, num_samples = 100) {
+  
+  result = NULL
+  for(i in 1:num_samples) {
+    sample_id = sample.int(length(precision_samples), 1)
+    precision = precision_samples[sample_id]
+    one_sample = volby %>% mutate(Predicted_Mean = Podil_Kraj, Sample = i, Predicted_PSP = Predicted_Mean + rnorm(length(Predicted_Mean), 0, precision))
+    if(is.null(result)) {
+      result = one_sample
+    } else {
+      result = rbind(result, one_sample)
+    }
+  }
+  return(result)
+}
+
+prior_check_normal = function(volby, precision_prior_mean, precision_prior_sd) {
+  samples = sample_volby_normal(volby, rlnorm(1000, precision_prior_mean, precision_prior_sd))
+  #samples = sample_volby_beta(volby, precision_samples_volby_beta(fit_volby_beta(volby, precision_prior_mean, precision_prior_sd, prior_only = TRUE)))
+  plot_samples(samples, paste0("sigma ~ logN(", precision_prior_mean,", ", precision_prior_sd, ")"))
+}
+
+prior_check_normal(volby, -2, 0.1)
+
+```
+
+
+
+
+##Prior predictive check
+```{r}
+fit_volby_beta = function(volby, precision_prior_mean, precision_prior_sd, prior_only = FALSE) {
+  data = list(
+    N = length(volby$Rok_Kraj),
+    prediction = volby$Podil_Kraj,
+    actual = volby$Podil_PSP,
+    precision_prior_mean = precision_prior_mean,
+    precision_prior_sd = precision_prior_sd,
+    prior_only = if_else(prior_only, 1, 0)
+  )
+  fit = stan('volby-beta.stan',data = data, control = list(adapt_delta = 0.9))
+  return(fit)  
+}
+
+precision_samples_volby_beta = function(fit) {
+  all_samples = rstan::extract(fit)
+  return(all_samples$precision)
+}
+
+sample_volby_beta = function(volby, precision_samples, num_samples = 100) {
+  
+  result = NULL
+  for(i in 1:num_samples) {
+    sample_id = sample.int(length(precision_samples), 1)
+    precision = precision_samples[sample_id]
+    one_sample = volby %>% mutate(Predicted_Mean = Podil_Kraj, Sample = i, Predicted_PSP = rbeta(length(Predicted_Mean), Predicted_Mean * (precision), (1 - Predicted_Mean) * (precision)))
+    if(is.null(result)) {
+      result = one_sample
+    } else {
+      result = rbind(result, one_sample)
+    }
+  }
+  return(result)
+}
+
+prior_check_beta = function(volby, precision_prior_mean, precision_prior_sd) {
+  samples = sample_volby_beta(volby, rlnorm(1000, precision_prior_mean, precision_prior_sd))
+  #samples = sample_volby_beta(volby, precision_samples_volby_beta(fit_volby_beta(volby, precision_prior_mean, precision_prior_sd, prior_only = TRUE)))
+  plot_samples(samples, paste0("precision ~ logN(", precision_prior_mean,", ", precision_prior_sd, ")"))
+}
+
+prior_check_beta(volby, 10, 10)
+
+```
+
+```{r}
+prior_check_beta(volby, 5, 2)
+prior_check_beta(volby, 4, 0.5)
+prior_check_beta(volby, 4, 1)
+print(exp(2))
+print(exp(6))
+```
+
+```{r}
+  fit_beta = fit_volby_beta(volby, 4, 1)
+  summary(fit_beta)$summary
+```
+
+```{r}
+sample_func_beta = function(fit, volby, num_samples = 100) {
+  sample_volby_beta(volby, precision_samples_volby_beta(fit), num_samples)
+}
+
+posterior_plot = function(fit, volby, sample_func, title = "posterior predictive") {
+  result = sample_func(fit, volby)
+      
+  plot_samples(result, title) + 
+    geom_line(aes(y = Podil_Kraj), color = "blue", data = volby, size = 1) +
+    geom_line(aes(y = Podil_PSP), color = "black", data = volby, size = 1.5) 
+}
+
+compute_diffs = function(data, additional_join = c()) {
+  data %>% 
+    left_join(data, by = c(additional_join, "Strana")) %>% 
+    filter(Rok_Kraj.x == Rok_Kraj.y - 4) %>%
+    mutate(Diff = Predicted_PSP.y - Predicted_PSP.x, Rok = Rok_PSP.x) %>%
+    select(Strana, Rok,  Diff)
+}
+
+posterior_check_diff = function(fit, volby, sample_func, title = "Check diff") {
+  diffs_measured = compute_diffs(volby %>% mutate(Predicted_PSP = Podil_PSP))
+  diffs_model = compute_diffs(sample_func(fit, volby), "Sample")
+  diffs_model %>% ggplot(aes(x = Diff)) + geom_histogram(bins = 20) + geom_vline(aes(xintercept = Diff), data = diffs_measured, color = "red", size = 1) +
+    facet_grid(Strana ~ Rok, scales = "free")
+}
+
+error_plot = function(fit, volby, sample_func, title = "Error") {
+  result = sample_func(fit, volby, 2000) %>% 
+    mutate(Error = Podil_PSP - Predicted_PSP) 
+  plot_overall = result %>%
+    ggplot(aes(x = Error)) + geom_histogram(bins = 20) + geom_vline(xintercept = 0, color= "red")
+  
+  plot_facet = plot_overall  + facet_grid(Strana ~ Rok_PSP, scales = "free") 
+  
+  cat("Error mean: ", mean(result$Error) ,", sd: ", sd(result$Error), "\n")
+  cat("P(|Error| < 0.10) = ", mean(abs(result$Error) < 0.1) ,"\n")
+  cat("P(|Error| < 0.05) = ", mean(abs(result$Error) < 0.05) ,"\n")
+  print(plot_overall)
+  print(plot_facet)
+  
+}
+
+
+hist(precision_samples_volby_beta(fit_beta))
+posterior_plot(fit_beta, volby, sample_func_beta)
+error_plot(fit_beta, volby, sample_func_beta)
+posterior_check_diff(fit_beta, volby, sample_func_beta)
+```
+
+#Prior predictive check
+
+Stupid error in model (normal error on percentage data)
+
+```{r}
+prior_check_full_pooling = function(prior_effect_mean, prior_effect_sd, prior_intercept_mean,prior_intercept_sd,
+                                 result_sd) {
+num_samples = 100
+prior_check = NULL
+for(i in 1:num_samples) {
+  effect = rnorm(1,prior_effect_mean,prior_effect_sd)
+  intercept = rnorm(1,prior_intercept_mean,prior_intercept_sd)
+  #precision = rgamma(1, shape = prior_precision_shape, rate = prior_precision_rate)
+  one_sample = volby %>% mutate(Predicted_Mean = logistic(Normalized_Kraj_All * effect + intercept), Sample = i, Predicted_PSP = Predicted_Mean + rnorm(length(Predicted_Mean), 0, result_sd))
+  if(is.null(prior_check)) {
+    prior_check = one_sample
+  } else {
+    prior_check = rbind(prior_check, one_sample)
+  }
+}
+
+prior_check %>% mutate(Sample = as.factor(Sample)) %>% ggplot(aes(x = Rok_PSP, y = Predicted_PSP, color = Sample)) + geom_line(alpha = 0.3) + facet_wrap( ~ Strana) + guides(color = FALSE) + 
+  ggtitle(paste0("effect ~ N(", prior_effect_mean , "," , prior_effect_sd , "), intercept ~ N(" , prior_intercept_mean , "," , prior_intercept_sd, "), error ~ N(0, ", result_sd,")")) #+ coord_cartesian(ylim= c(0,1))
+  
+}
+
+prior_check_full_pooling(0,1,0,1, 0.1)
+
+```
+
+OK model
+
+```{r}
+draw_sample = function(volby, effect, intercept, precision, index) {
+  volby %>% mutate(Predicted_Mean = logistic(Normalized_Kraj_All * effect + intercept), Sample = index, Predicted_PSP = rbeta(length(Predicted_Mean), Predicted_Mean * (precision), (1 - Predicted_Mean) * (precision)))
+  
+}
+
+prior_check_full_pooling = function(prior_effect_mean, prior_effect_sd, prior_intercept_mean,prior_intercept_sd,
+                                 prior_precision_mean, prior_precision_sd) {
+num_samples = 100
+prior_check = NULL
+for(i in 1:num_samples) {
+  effect = rnorm(1,prior_effect_mean,prior_effect_sd)
+  intercept = rnorm(1,prior_intercept_mean,prior_intercept_sd)
+  #precision = rgamma(1, shape = prior_precision_shape, rate = prior_precision_rate)
+  precision = rlnorm(1, prior_precision_mean,prior_precision_sd)
+  one_sample = draw_sample(volby, effect, intercept, precision, i)
+  if(is.null(prior_check)) {
+    prior_check = one_sample
+  } else {
+    prior_check = rbind(prior_check, one_sample)
+  }
+}
+
+plot_samples(prior_check, paste0("effect ~ N(", prior_effect_mean , "," , prior_effect_sd , "), intercept ~ N(" , prior_intercept_mean , "," , prior_intercept_sd, "), precision ~ logN(",prior_precision_mean,", ", prior_precision_sd,")")) 
+  
+}
+
+prior_check_full_pooling(0,1,0,1, 100, 0.1)
+
+```
+
+Figuring out the parameters
+
+```{r}
+prior_check_full_pooling(0.5,0.5,-1,1, 100, 0.1)
+prior_check_full_pooling(0.5,0.2,-2,0.5, 100, 0.1)
+prior_check_full_pooling(0.2,0.2,-2,0.5, 100, 0.1)
+prior_check_full_pooling(0.2,0.2,-2,0.5, 3,1)
+prior_check_full_pooling(0.2,0.2,-2,0.5, 4,0.5)
+prior_check_full_pooling(0.2,0.3,-2,0.7, 4,1)
+
+```
+#Full pooling model
+```{r}
+do_fit_full_pooling = function(data) {
+  brm(Podil_PSP ~ Normalized_Kraj_All + 0 + intercept, data = data, family = "beta", prior = c(
+    prior(normal(0.2,0.3), class = "b", coef = Normalized_Kraj_All),
+    prior(normal(-2,0.7), class = "b", coef = "intercept"),
+    prior(lognormal(4,1), class = "phi")
+  ))
+  
+}
+
+fit_full_pooling = do_fit_full_pooling(volby)
+summary(fit_full_pooling)
+```
+
+```{r}
+param_hist_full_pooling = function(fit, title = "") {
+  all_samples = posterior_samples(fit)
+  df = data.frame(effect = all_samples[,"b_Normalized_Kraj_All"], precision = all_samples[,"phi"]) #, intercept = all_samples[,"b_intercept"]
+  plot = df %>% gather(parameter, value) %>% ggplot(aes(x = value)) + geom_histogram(bins = 30) + facet_wrap(~ parameter, scales = "free") + ggtitle(title)
+  return(plot)
+} 
+
+param_hist_full_pooling(fit_full_pooling)
+```
+
+
+```{r}
+posterior_samples_full_pooling = function(fit, volby, num_samples = 100) {
+  result = NULL
+  all_samples = posterior_samples(fit)
+  for(i in 1:num_samples) {
+    sample_id = sample.int(dim(all_samples)[1], 1)
+    effect = all_samples[sample_id, "b_Normalized_Kraj_All"]
+    intercept = all_samples[sample_id, "b_intercept"]
+    precision = all_samples[sample_id, "phi"]
+    one_sample = draw_sample(volby, effect, intercept, precision, i)
+    if(is.null(result)) {
+      result = one_sample
+    } else {
+      result = rbind(result, one_sample)
+    }
+  }
+  return(result)
+}
+
+
+
+posterior_check_diff(fit_full_pooling, volby, posterior_samples_full_pooling)
+posterior_plot(fit_full_pooling, volby, posterior_samples_full_pooling)
+
+```
+
+```{r}
+
+error_plot(fit_full_pooling, volby,posterior_samples_full_pooling)
+```
+
+
+#Fit each separately
+```{r}
+fits_no_pooling = list()
+strany = c('CSSD','ODS','KSCM')
+for(strana in strany) {
+  filteredData = volby %>% filter(Strana == strana)
+  fit_strana = update(fit_full_pooling, newdata =  filteredData)
+  fits_no_pooling[[strana]] <- fit_strana
+  print(summary(fit_strana))
+}
+```
+```{r}
+for(strana in strany) {
+  filteredData = volby %>% filter(Strana == strana)
+  print(posterior_plot(fits_no_pooling[[strana]], filteredData, posterior_samples_full_pooling, paste0("posterior - ", strana)))
+  print(posterior_check_diff(fit_full_pooling, filteredData, posterior_samples_full_pooling, strana))
+  print(param_hist_full_pooling(fits_no_pooling[[strana]], strana))
+  error_plot(fits_no_pooling[[strana]], filteredData, posterior_samples_full_pooling, paste("Error", strana))
+}
+
+```
+```{r}
+fit_partial_pooling = brm(Podil_PSP ~ (Normalized_Kraj_All + 0| Strana) + 0 + intercept, data = volby, family = "beta", control = list(adapt_delta = 0.95), prior = c(
+    #prior(normal(0.2,0.3), class = "b", coef = Normalized_Kraj_All),
+    prior(normal(-2,0.7), class = "b", coef = "intercept"),
+    prior(lognormal(4,1), class = "phi")))
+
+summary(fit_partial_pooling)
+```
+
+```{r}
+posterior_samples_partial_pooling = function(fit, volby, num_samples = 100) {
+  result = NULL
+  all_samples = posterior_samples(fit)
+  effect_indices = paste0("r_Strana[", as.character(volby$Strana), ",Normalized_Kraj_All]")
+  for(i in 1:num_samples) {
+    sample_id = sample.int(dim(all_samples)[1], 1)
+    effect = as.numeric(all_samples[sample_id, effect_indices])
+    intercept = all_samples[sample_id, "b_intercept"]
+    precision = all_samples[sample_id, "phi"]
+    one_sample = draw_sample(volby, effect, intercept, precision, i)
+    if(is.null(result)) {
+      result = one_sample
+    } else {
+      result = rbind(result, one_sample)
+    }
+  }
+  return(result)
+}
+
+posterior_check_diff(fit_partial_pooling, volby, posterior_samples_partial_pooling)
+posterior_plot(fit_partial_pooling, volby, posterior_samples_partial_pooling)
+error_plot(fit_partial_pooling, volby,posterior_samples_partial_pooling)
+posterior_samples(fit_partial_pooling) %>% gather(parameter, value, -lp__) %>% 
+  ggplot(aes(x = value)) + geom_histogram(bins = 20) + facet_wrap(~ parameter, scales = "free")
+
+```
+
