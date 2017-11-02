@@ -1,0 +1,93 @@
+---
+title: "Power"
+output: html_notebook
+---
+
+```{r setup}
+library(rstan)
+library(ggplot2)
+library(tidyverse)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+logistic = function(x) {1/(1 + exp(-x))}
+
+```
+
+```{r}
+result = data.frame(id = 1:10000, effect = NA, p = NA, lower_confidence = NA)
+true_effect = 500
+sd = 3500
+
+for(i in 1:10000) {
+  baseline = rnorm(20, 0, sd)
+  treatment = rnorm(20,  true_effect, sd)
+  test_result = t.test(treatment, baseline)
+  if(test_result$conf.int[2] < 0) {
+    result[i, "lower_confidence"] = test_result$conf.int[2] 
+  } else {
+    result[i, "lower_confidence"] = test_result$conf.int[1] 
+  }
+  result[i, "effect"] = mean(treatment) - mean(baseline)
+  result[i, "p"] = test_result$p.value
+}
+```
+
+```{r}
+mean(result$p < 0.05)
+results_sig = result %>% filter(p < 0.05)  
+results_sig %>% mutate(lower_confidence = abs(lower_confidence)) %>% gather(statistic, value, -p, -id) %>% ggplot(aes(x = value)) + geom_histogram(bins = 30) + facet_wrap(~ statistic, scales = "free")
+results_sig %>% filter(effect > 0) %>% summarize(mean_exaggeration = mean(effect), minimal_exaggeration = min(effect))
+results_sig %>% summarize(wrong_sign = mean(effect < 0), higher_500 = mean(lower_confidence > 500), higher_1000 = mean(lower_confidence > 1000))
+```
+
+```{r}
+ t.test(c(0,1),c(4,5), var.equal = TRUE)
+```
+
+```{r}
+stan_code = '
+data {
+  real difference_prior_mean;
+  real difference_prior_sigma;
+  real sigma_prior;
+  int N;
+  real a[N]; 
+  real b[N];
+}
+
+parameters {
+  real a_mean;
+  real<lower=0> sigma;
+  real difference;
+}
+
+model {
+  difference ~ normal(difference_prior_mean, difference_prior_sigma);
+  a ~ normal(a_mean, sigma);
+  b ~ normal(a_mean + difference, sigma);
+  sigma ~ cauchy(0, sigma_prior);
+}
+'
+
+```
+
+```{r}
+data = list(difference_prior_mean = 0, difference_prior_sigma = 1, sigma_prior = 5, 
+            N = 2, a = c(0,1), b=c(4,5)
+            )
+fit = stan(model_code = stan_code, data = data, control = list(adapt_delta= 0.95))
+
+summary(fit)$summary
+
+samples = rstan::extract(fit)
+data.frame(difference = samples$difference, a_mean = samples$a_mean, 
+           sigma = samples$sigma
+           ) %>%  
+  gather(parameter, value) %>% ggplot(aes(x = value)) + geom_histogram(bins = 30) + facet_wrap(~parameter, scales = "free", ncol = 2)
+
+mean(abs(samples$difference) > 0.5)
+
+```
+
+
